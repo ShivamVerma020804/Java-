@@ -1,0 +1,480 @@
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.*;
+import java.util.List;
+import java.util.Arrays;
+
+public class SudokuVisualizer extends JFrame {
+
+    // --- Model ---
+    private final int[][] board = new int[9][9];       // 0 means empty
+    private int[][] initial = new int[9][9];           // remembers given clues
+    private int selRow = -1, selCol = -1;
+
+    // --- Solver / animation ---
+    private SolverWorker worker;
+    private volatile boolean stepMode = false;
+    private volatile int delayMs = 50;
+
+    // --- UI ---
+    private final GridPanel gridPanel = new GridPanel();
+    private final JLabel status = new JLabel("Ready.");
+    private final JButton playPauseBtn = new JButton("▶ Solve");
+    private final JButton stepBtn = new JButton("Step");
+    private final JButton resetBtn = new JButton("Reset");
+    private final JButton loadBtn = new JButton("Load Sample");
+    private final JSlider speed = new JSlider(0, 300, 50); // ms per step
+    private final JTextArea pasteArea = new JTextArea(3, 30);
+
+    public SudokuVisualizer() {
+        super("Sudoku Solver Visualizer (Backtracking)");
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLayout(new BorderLayout(10, 10));
+        ((JComponent) getContentPane()).setBorder(new EmptyBorder(8,8,8,8));
+
+        // Grid
+        gridPanel.setPreferredSize(new Dimension(540, 540));
+        add(gridPanel, BorderLayout.CENTER);
+
+        // Controls
+        JPanel controls = new JPanel(new GridBagLayout());
+        GridBagConstraints c = new GridBagConstraints();
+        c.insets = new Insets(4,4,4,4);
+        c.gridx = 0; c.gridy = 0;
+        playPauseBtn.setFocusable(false);
+        controls.add(playPauseBtn, c);
+
+        c.gridx++;
+        stepBtn.setFocusable(false);
+        controls.add(stepBtn, c);
+
+        c.gridx++;
+        resetBtn.setFocusable(false);
+        controls.add(resetBtn, c);
+
+        c.gridx++;
+        loadBtn.setFocusable(false);
+        controls.add(loadBtn, c);
+
+        c.gridx = 0; c.gridy = 1; c.gridwidth = 4;
+        JPanel speedBox = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        speed.setMajorTickSpacing(100);
+        speed.setMinorTickSpacing(50);
+        speed.setPaintLabels(true);
+        speed.setPaintTicks(true);
+        speedBox.add(new JLabel("Delay (ms):"));
+        speedBox.add(speed);
+        controls.add(speedBox, c);
+
+        c.gridx = 0; c.gridy = 2; c.gridwidth = 4;
+        pasteArea.setLineWrap(true);
+        pasteArea.setWrapStyleWord(true);
+        pasteArea.setBorder(BorderFactory.createTitledBorder("Paste 81 chars (0/.) for blanks, or 9 lines of digits"));
+        controls.add(new JScrollPane(pasteArea), c);
+
+        add(controls, BorderLayout.EAST);
+
+        // Status
+        status.setBorder(new EmptyBorder(6,0,0,0));
+        add(status, BorderLayout.SOUTH);
+
+        // Actions
+        playPauseBtn.addActionListener(e -> onPlayPause());
+        stepBtn.addActionListener(e -> onStep());
+        resetBtn.addActionListener(e -> onReset());
+        loadBtn.addActionListener(e -> onLoadSample());
+        speed.addChangeListener(e -> delayMs = speed.getValue());
+
+        // Keyboard input to grid
+        gridPanel.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) {
+                Point p = e.getPoint();
+                int cell = gridPanel.pointToCell(p);
+                if (cell >= 0) {
+                    selRow = cell / 9;
+                    selCol = cell % 9;
+                    gridPanel.repaint();
+                }
+            }
+        });
+        gridPanel.setFocusable(true);
+        gridPanel.addKeyListener(new KeyAdapter() {
+            @Override public void keyTyped(KeyEvent e) {
+                if (worker != null && !worker.isDone()) return; // lock during solving
+                if (selRow < 0 || selCol < 0) return;
+                char ch = e.getKeyChar();
+                if (ch == '.' || ch == '0' || ch == KeyEvent.VK_BACK_SPACE || ch == KeyEvent.VK_DELETE) {
+                    if (initial[selRow][selCol] == 0) {
+                        board[selRow][selCol] = 0;
+                        gridPanel.repaint();
+                    }
+                    return;
+                }
+                if (ch >= '1' && ch <= '9') {
+                    if (initial[selRow][selCol] == 0) {
+                        board[selRow][selCol] = ch - '0';
+                        gridPanel.repaint();
+                    }
+                }
+            }
+        });
+
+        pack();
+        setLocationRelativeTo(null);
+        onLoadSample(); // start with something
+    }
+
+    // --- Control handlers ---
+    private void onPlayPause() {
+        if (worker != null && !worker.isDone()) {
+            // pause
+            stepMode = true;
+            playPauseBtn.setText("▶ Resume");
+            status.setText("Paused. Press Resume or Step.");
+            return;
+        }
+        // start/resume
+        if (!isValidStart()) {
+            JOptionPane.showMessageDialog(this, "Puzzle has conflicts. Fix or Reset.", "Invalid start", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (isSolved(board)) {
+            status.setText("Already solved!");
+            return;
+        }
+        stepMode = false;
+        playPauseBtn.setText("⏸ Pause");
+        status.setText("Solving...");
+        startWorker();
+    }
+
+    private void onStep() {
+        stepMode = true;
+        if (worker == null || worker.isDone()) {
+            if (!isValidStart()) {
+                JOptionPane.showMessageDialog(this, "Puzzle has conflicts. Fix or Reset.", "Invalid start", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            startWorker();
+        }
+    }
+
+    private void onReset() {
+        if (worker != null && !worker.isDone()) worker.cancel(true);
+        copy(initial, board);
+        selRow = selCol = -1;
+        playPauseBtn.setText("▶ Solve");
+        status.setText("Reset to initial puzzle.");
+        gridPanel.clearHighlights();
+        gridPanel.repaint();
+    }
+
+    private void onLoadSample() {
+        String sample =
+                "530070000" +
+                "600195000" +
+                "098000060" +
+                "800060003" +
+                "400803001" +
+                "700020006" +
+                "060000280" +
+                "000419005" +
+                "000080079";
+        loadFromString(sample);
+        pasteArea.setText(
+                "530070000\n600195000\n098000060\n800060003\n400803001\n700020006\n060000280\n000419005\n000080079"
+        );
+        status.setText("Loaded sample puzzle. Edit cells, then Solve.");
+    }
+
+    // Parse pasteArea if user put text, else keep current grid
+    private boolean tryLoadFromTextArea() {
+        String text = pasteArea.getText().replaceAll("\\s+", "");
+        if (text.length() == 81) {
+            loadFromString(text);
+            return true;
+        }
+        return false;
+    }
+
+    private void loadFromString(String s) {
+        if (s == null) return;
+        s = s.replaceAll("\\s+", "");
+        if (s.length() != 81) return;
+        for (int i = 0; i < 81; i++) {
+            char ch = s.charAt(i);
+            if (ch == '.' || ch == '0') {
+                board[i/9][i%9] = 0;
+            } else if (Character.isDigit(ch)) {
+                board[i/9][i%9] = ch - '0';
+            } else {
+                board[i/9][i%9] = 0;
+            }
+        }
+        copy(board, initial);
+        gridPanel.clearHighlights();
+        gridPanel.repaint();
+    }
+
+    private void startWorker() {
+        // If paste text looks valid, load it once before solving
+        tryLoadFromTextArea();
+        gridPanel.clearHighlights();
+        worker = new SolverWorker();
+        worker.execute();
+    }
+
+    // --- Validation ---
+    private boolean isValidStart() {
+        // No conflicts with current board (ignoring zeros)
+        for (int r = 0; r < 9; r++) {
+            for (int c = 0; c < 9; c++) {
+                int v = board[r][c];
+                if (v != 0) {
+                    board[r][c] = 0;
+                    boolean ok = isSafe(board, r, c, v);
+                    board[r][c] = v;
+                    if (!ok) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // --- Solver (backtracking with publish of each step) ---
+    private class SolverWorker extends SwingWorker<Void, Step> {
+        private boolean solved = false;
+
+        @Override
+        protected Void doInBackground() throws Exception {
+            solved = solve();
+            return null;
+        }
+
+        private boolean solve() throws InterruptedException {
+            int[] cell = findEmpty(board);
+            if (cell == null) { return true; }
+            int r = cell[0], c = cell[1];
+
+            for (int num = 1; num <= 9; num++) {
+                if (Thread.currentThread().isInterrupted() || isCancelled()) return false;
+
+                publish(new Step(r, c, num, StepType.TRY));
+                waitOrStep();
+
+                if (isSafe(board, r, c, num)) {
+                    board[r][c] = num;
+                    publish(new Step(r, c, num, StepType.PLACE));
+                    waitOrStep();
+
+                    if (solve()) return true;
+
+                    // backtrack
+                    board[r][c] = 0;
+                    publish(new Step(r, c, 0, StepType.BACKTRACK));
+                    waitOrStep();
+                } else {
+                    publish(new Step(r, c, num, StepType.REJECT));
+                    waitOrStep();
+                }
+            }
+            return false;
+        }
+
+        private void waitOrStep() throws InterruptedException {
+            if (stepMode) {
+                // In step mode, pause until another step/resume happens
+                synchronized (SolverWorker.this) {
+                    SolverWorker.this.wait(10); // small wait to allow UI repaint
+                }
+            } else {
+                Thread.sleep(Math.max(0, delayMs));
+            }
+        }
+
+        @Override
+        protected void process(List<Step> chunks) {
+            // Apply only the last step in the batch for UI
+            if (chunks.isEmpty()) return;
+            Step s = chunks.get(chunks.size() - 1);
+            selRow = s.r; selCol = s.c;
+            gridPanel.setFlash(s);
+            gridPanel.repaint();
+            switch (s.type) {
+                case PLACE -> status.setText("Placed " + s.value + " at (" + (s.r+1) + "," + (s.c+1) + ")");
+                case BACKTRACK -> status.setText("Backtracking from (" + (s.r+1) + "," + (s.c+1) + ")");
+                case REJECT -> status.setText("Tried " + s.value + " at (" + (s.r+1) + "," + (s.c+1) + ") → not safe");
+                case TRY -> status.setText("Trying " + s.value + " at (" + (s.r+1) + "," + (s.c+1) + ")");
+            }
+        }
+
+        @Override
+        protected void done() {
+            boolean cancelled = isCancelled();
+            if (!cancelled) {
+                try {
+                    get(); // surface exceptions
+                } catch (Exception ignored) {}
+            }
+            if (!cancelled && isSolved(board)) {
+                status.setText("Solved! 🎉");
+            } else if (cancelled) {
+                status.setText("Cancelled.");
+            } else {
+                status.setText("No solution found.");
+            }
+            playPauseBtn.setText("▶ Solve");
+        }
+    }
+
+    // --- Grid drawing ---
+    private class GridPanel extends JPanel {
+        private Step flashStep = null;
+        private long flashStart = 0L;
+
+        void setFlash(Step s) {
+            flashStep = s;
+            flashStart = System.currentTimeMillis();
+        }
+        void clearHighlights() {
+            flashStep = null;
+            flashStart = 0L;
+        }
+
+        int pointToCell(Point p) {
+            int size = Math.min(getWidth(), getHeight());
+            int cell = size / 9;
+            int startX = (getWidth() - size) / 2;
+            int startY = (getHeight() - size) / 2;
+            int x = p.x - startX;
+            int y = p.y - startY;
+            if (x < 0 || y < 0 || x >= size || y >= size) return -1;
+            int c = x / cell;
+            int r = y / cell;
+            return r * 9 + c;
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+            int size = Math.min(getWidth(), getHeight());
+            int cell = size / 9;
+            int startX = (getWidth() - size) / 2;
+            int startY = (getHeight() - size) / 2;
+
+            // Background
+            g2.setColor(new Color(246, 248, 250));
+            g2.fillRoundRect(startX-6, startY-6, size+12, size+12, 18, 18);
+
+            // Flash for backtrack or place
+            if (flashStep != null) {
+                long elapsed = System.currentTimeMillis() - flashStart;
+                float alpha = Math.max(0f, 1f - (elapsed / 250f)); // quick fade
+                if (alpha > 0f) {
+                    int rr = flashStep.r, cc = flashStep.c;
+                    int x = startX + cc * cell;
+                    int y = startY + rr * cell;
+                    Color cFlash = switch (flashStep.type) {
+                        case BACKTRACK -> new Color(255, 100, 100, (int)(120 * alpha));
+                        case PLACE -> new Color(100, 200, 255, (int)(120 * alpha));
+                        case REJECT -> new Color(255, 180, 120, (int)(120 * alpha));
+                        default -> new Color(120, 200, 255, (int)(90 * alpha));
+                    };
+                    g2.setColor(cFlash);
+                    g2.fillRect(x, y, cell, cell);
+                }
+            }
+
+            // Selection
+            if (selRow >= 0 && selCol >= 0) {
+                g2.setColor(new Color(180, 210, 255, 120));
+                int x = startX + selCol * cell;
+                int y = startY + selRow * cell;
+                g2.fillRect(x, y, cell, cell);
+            }
+
+            // Numbers
+            Font fontGiven = getFont().deriveFont(Font.BOLD, Math.max(18f, cell * 0.5f));
+            Font fontFill  = getFont().deriveFont(Font.PLAIN, Math.max(18f, cell * 0.5f));
+            FontMetrics fmGiven = getFontMetrics(fontGiven);
+            FontMetrics fmFill  = getFontMetrics(fontFill);
+
+            for (int r = 0; r < 9; r++) {
+                for (int c = 0; c < 9; c++) {
+                    int v = board[r][c];
+                    if (v == 0) continue;
+                    int x = startX + c * cell;
+                    int y = startY + r * cell;
+                    String s = Integer.toString(v);
+                    Font font = (initial[r][c] != 0) ? fontGiven : fontFill;
+                    FontMetrics fm = (initial[r][c] != 0) ? fmGiven : fmFill;
+                    int tx = x + (cell - fm.stringWidth(s)) / 2;
+                    int ty = y + (cell + fm.getAscent() - fm.getDescent()) / 2;
+                    g2.setColor((initial[r][c] != 0) ? new Color(30, 30, 30) : new Color(40, 70, 160));
+                    g2.setFont(font);
+                    g2.drawString(s, tx, ty);
+                }
+            }
+
+            // Grid lines
+            for (int i = 0; i <= 9; i++) {
+                float thick = (i % 3 == 0) ? 3f : 1f;
+                g2.setStroke(new BasicStroke(thick));
+                g2.setColor(new Color(60, 60, 60));
+                // vertical
+                int x = startX + i * cell;
+                g2.drawLine(x, startY, x, startY + 9 * cell);
+                // horizontal
+                int y = startY + i * cell;
+                g2.drawLine(startX, y, startX + 9 * cell, y);
+            }
+
+            g2.dispose();
+        }
+    }
+
+    // --- Utilities / Sudoku rules ---
+    private static boolean isSafe(int[][] b, int r, int c, int v) {
+        for (int i = 0; i < 9; i++) {
+            if (b[r][i] == v) return false;
+            if (b[i][c] == v) return false;
+        }
+        int br = (r / 3) * 3, bc = (c / 3) * 3;
+        for (int i = br; i < br + 3; i++)
+            for (int j = bc; j < bc + 3; j++)
+                if (b[i][j] == v) return false;
+        return true;
+    }
+
+    private static int[] findEmpty(int[][] b) {
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (b[r][c] == 0) return new int[]{r, c};
+        return null;
+    }
+
+    private static boolean isSolved(int[][] b) {
+        for (int r = 0; r < 9; r++)
+            for (int c = 0; c < 9; c++)
+                if (b[r][c] == 0) return false;
+        // Optional: strict validation (rows/cols/boxes all 1..9)
+        return true;
+    }
+
+    private static void copy(int[][] from, int[][] to) {
+        for (int i = 0; i < 9; i++) to[i] = Arrays.copyOf(from[i], 9);
+    }
+
+    // --- Step struct for UI feedback ---
+    private enum StepType { TRY, PLACE, REJECT, BACKTRACK }
+    private record Step(int r, int c, int value, StepType type) {}
+
+    // --- Main ---
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new SudokuVisualizer().setVisible(true));
+    }
+}
